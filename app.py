@@ -278,10 +278,18 @@ def get_violations(lat, lng):
             "$order": "violation_date DESC", "$limit": "15"})
         out = []
         for r in rows:
+            addr = " ".join(p for p in [
+                clean_num(r.get("street_number")),
+                clean_num(r.get("street_direction")),
+                clean_num(r.get("street_name")),
+                clean_num(r.get("street_type"))] if p)
             out.append({"date": str(r.get("violation_date", ""))[:10],
+                        "addr": addr.title(),
                         "desc": clean_num(r.get("violation_description"))[:160],
                         "status": clean_num(r.get("violation_status")),
-                        "code": clean_num(r.get("violation_ordinance"))})
+                        "code": clean_num(r.get("violation_ordinance")),
+                        "comments": clean_num(r.get("violation_inspector_comments")),
+                        "bureau": clean_num(r.get("department_bureau"))})
         return out
     except Exception:
         return []
@@ -307,6 +315,7 @@ table{width:100%;border-collapse:collapse;font-size:14px}
 th{text-align:left;color:#666;border-bottom:2px solid #ddd;padding:6px}
 td{border-bottom:1px solid #eee;padding:6px;vertical-align:top}
 .note{font-size:13px;color:#666;margin-top:16px}
+details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 .src{font-size:12px;color:#999}
 </style></head><body>
 <h1>Building Lookup</h1>
@@ -327,10 +336,10 @@ td{border-bottom:1px solid #eee;padding:6px;vertical-align:top}
 <div class="card"><h2>{{result.kind}}</h2>
 <dl class="kv">{% for l,v in result.chars %}<dt>{{l}}</dt><dd>{{v}}</dd>{% endfor %}</dl></div>
 {% endif %}
-{% if result.values %}
+{% if result.assessed %}
 <div class="card"><h2>Assessed value history</h2>
 <table><tr><th>Year</th><th>Class</th><th>Total assessed</th></tr>
-{% for v in result.values %}<tr><td>{{v.year}}</td><td>{{v.class}}</td><td>${{v.total}}</td></tr>{% endfor %}
+{% for v in result.assessed %}<tr><td>{{v.year}}</td><td>{{v.class}}</td><td>${{v.total}}</td></tr>{% endfor %}
 </table></div>
 {% endif %}
 {% if result.sales %}
@@ -339,6 +348,14 @@ td{border-bottom:1px solid #eee;padding:6px;vertical-align:top}
 {% for s in result.sales %}<tr><td>{{s.date}}</td><td>${{s.price}}</td><td>{{s.deed}}</td><td>{{s.seller}}</td><td>{{s.buyer}}</td></tr>{% endfor %}
 </table></div>
 {% endif %}
+<div class="card"><h2>Ownership</h2>
+<div class="note">No free public API lists the current owner by name — the county sites that have it block automated lookups. The best free source is the most recent buyer on record:</div>
+{% if result.sales %}<dl class="kv"><dt>Most recent buyer</dt><dd>{{result.sales[0].buyer}} — bought {{result.sales[0].date}} for ${{result.sales[0].price}} ({{result.sales[0].deed}}, doc ref in sales table)</dd></dl>
+<div class="note">This is the last recorded buyer, which is usually but not always the current owner.</div>
+{% else %}<div class="note">No sales on record for this PIN, so no buyer name is available from free sources.</div>{% endif %}
+<div class="note">For the official taxpayer name, search this PIN on the Cook County Treasurer's site:</div>
+<dl class="kv"><dt>PIN</dt><dd>{{result.pin}}</dd></dl>
+<p><a href="https://www.cookcountytreasurer.com/" target="_blank" style="display:inline-block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none">Open the Treasurer's site</a></p></div>
 <div class="card"><h2>Deeds & recorded documents</h2>
 <div class="note">The deed copies themselves aren't free — the Cook County Clerk sells them per document on their site, and there's no free download. Search this PIN on the Clerk's site to find and purchase them:</div>
 <dl class="kv"><dt>PIN to search</dt><dd>{{result.pin}}</dd></dl>
@@ -350,9 +367,9 @@ td{border-bottom:1px solid #eee;padding:6px;vertical-align:top}
 {% for p in result.permits %}<tr><td>{{p.date}}</td><td>{{p.type}}</td><td>{{p.address}}</td><td>{{p.desc}}</td><td>{{p.cost}}</td></tr>{% endfor %}
 </table>{% else %}<div class="note">No permits found nearby.</div>{% endif %}</div>
 <div class="card"><h2>Chicago building violations (nearby)</h2>
-{% if result.violations %}<table><tr><th>Date</th><th>Description</th><th>Status</th></tr>
-{% for v in result.violations %}<tr><td>{{v.date}}</td><td>{{v.desc}}</td><td>{{v.status}}</td></tr>{% endfor %}
-</table>{% else %}<div class="note">No violations found nearby.</div>{% endif %}</div>
+{% if result.violations %}<table><tr><th>Date</th><th>Address</th><th>Violation</th><th>Status</th></tr>
+{% for v in result.violations %}<tr><td>{{v.date}}</td><td>{{v.addr}}</td><td>{{v.desc}}<details><summary>details</summary><div class="note"><b>Inspector:</b> {{v.comments}}<br><b>Ordinance:</b> {{v.code}}<br><b>Bureau:</b> {{v.bureau}}</div></details></td><td>{{v.status}}</td></tr>{% endfor %}
+</table><div class="note">These are within about 150 meters and may belong to neighboring properties — check the address column.</div>{% else %}<div class="note">No violations found nearby.</div>{% endif %}</div>
 {% endif %}
 <div class="src">Sources: U.S. Census Geocoder, Cook County GIS &amp; Open Data Portal, City of Chicago Open Data Portal. Data may lag behind county/city updates.</div>
 {% endif %}
@@ -395,7 +412,7 @@ def lookup():
     result = {"matched": geo["matched"], "pin": pin,
               "municipality": parcel["municipality"],
               "class_desc": parcel.get("class_info") or class_description(parcel["bldg_class"]),
-              "kind": kind, "chars": chars, "values": values, "sales": sales,
+              "kind": kind, "chars": chars, "assessed": values, "sales": sales,
               "permits": permits, "violations": violations}
     return render_template_string(PAGE, q=q, error=None, result=result)
 
