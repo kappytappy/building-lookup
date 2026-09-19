@@ -26,6 +26,10 @@ HTTP_TIMEOUT = 20
 
 COOK_VIEWER = ("https://gis.cookcountyil.gov/traditional/rest/services/"
                "CookViewer3Parcels/MapServer/0/query")
+COOK_ORTHO = ("https://gis.cookcountyil.gov/traditional/rest/services/"
+              "Ortho_Reference_Tiles/MapServer/export")
+COOK_PARCEL_MAP = ("https://gis.cookcountyil.gov/traditional/rest/services/"
+                   "CookViewer3Parcels/MapServer/export")
 COOK_SOCRATA = "https://datacatalog.cookcountyil.gov/resource"
 CHI_SOCRATA = "https://data.cityofchicago.org/resource"
 
@@ -291,6 +295,36 @@ def get_violations(lat, lng):
         return []
 
 
+# ---------------- step 5: aerial property photo ----------------
+
+def get_parcel_photo(pin):
+    """Returns (aerial_img_url, outline_img_url) — a county aerial photo of the
+    parcel with the parcel boundaries drawn over it. No API key needed."""
+    try:
+        r = requests.get(COOK_VIEWER, params={
+            "where": f"PIN14='{pin}'", "returnGeometry": "true",
+            "outSR": "4326", "outFields": "PIN14", "f": "json"},
+            timeout=HTTP_TIMEOUT)
+        feats = r.json().get("features", [])
+        if not feats:
+            return None, None
+        rings = feats[0]["geometry"]["rings"]
+        xs = [p[0] for ring in rings for p in ring]
+        ys = [p[1] for ring in rings for p in ring]
+        cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+        span = max(max(xs) - min(xs), max(ys) - min(ys), 0.00055) * 1.8
+        span = min(span, 0.004)
+        w, h = span / 2, span * 0.75 / 2  # 4:3 aspect
+        bbox = f"{cx-w},{cy-h},{cx+w},{cy+h}"
+        common = (f"bbox={bbox}&bboxSR=4326&imageSR=4326&size=800,600&f=image")
+        aerial = (f"{COOK_ORTHO}?{common}&format=jpg")
+        outline = (f"{COOK_PARCEL_MAP}?{common}&format=png32&transparent=true"
+                   f"&layers=show:0")
+        return aerial, outline
+    except Exception:
+        return None, None
+
+
 # ---------------- UI ----------------
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
@@ -330,6 +364,14 @@ details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 <dt>Municipality</dt><dd>{{result.municipality}}</dd>
 <dt>Property class</dt><dd>{{result.class_desc}}</dd>
 </dl></div>
+{% if result.aerial %}
+<div class="card"><h2>Property photo (aerial)</h2>
+<div style="position:relative;max-width:800px">
+<img src="{{result.aerial}}" alt="Aerial photo of the property" style="width:100%;display:block;border-radius:6px">
+<img src="{{result.outline}}" alt="" style="position:absolute;top:0;left:0;width:100%;pointer-events:none">
+</div>
+<div class="note">Aerial imagery from Cook County GIS with parcel boundaries overlaid — it may be a few years old, so recent changes might not show.</div></div>
+{% endif %}
 {% if result.kind %}
 <div class="card"><h2>{{result.kind}}</h2>
 <dl class="kv">{% for l,v in result.chars %}<dt>{{l}}</dt><dd>{{v}}</dd>{% endfor %}</dl></div>
@@ -401,19 +443,22 @@ def lookup():
         jobs = [{"parcel": p,
                  "f_chars": ex.submit(get_characteristics, p["pin"]),
                  "f_values": ex.submit(get_values, p["pin"]),
-                 "f_sales": ex.submit(get_sales, p["pin"])} for p in parcels]
+                 "f_sales": ex.submit(get_sales, p["pin"]),
+                 "f_photo": ex.submit(get_parcel_photo, p["pin"])} for p in parcels]
         f_permits = ex.submit(get_permits, geo["lat"], geo["lng"]) if in_chicago else None
         f_viol = ex.submit(get_violations, geo["lat"], geo["lng"]) if in_chicago else None
         results = []
         for j in jobs:
             p = j["parcel"]
             kind, chars = j["f_chars"].result()
+            aerial, outline = j["f_photo"].result()
             results.append({"matched": geo["matched"], "pin": p["pin"],
                             "municipality": p["municipality"],
                             "class_desc": p.get("class_info") or class_description(p["bldg_class"]),
                             "kind": kind, "chars": chars,
                             "assessed": j["f_values"].result(),
-                            "sales": j["f_sales"].result()})
+                            "sales": j["f_sales"].result(),
+                            "aerial": aerial, "outline": outline})
         permits = f_permits.result() if f_permits else None
         violations = f_viol.result() if f_viol else None
 
