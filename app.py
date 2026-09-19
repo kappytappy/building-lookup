@@ -380,14 +380,17 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Building Lookup - Cook County</title>
 <style>
-body{font-family:Segoe UI,Arial,sans-serif;max-width:900px;margin:0 auto;padding:20px;color:#222}
+body{font-family:Segoe UI,Arial,sans-serif;max-width:1200px;margin:0 auto;padding:20px;color:#222}
 h1{font-size:24px;margin-bottom:4px}.sub{color:#666;margin-bottom:18px;font-size:14px}
 form{display:flex;gap:8px;margin-bottom:20px}
 input[type=text]{flex:1;padding:10px;font-size:16px;border:1px solid #ccc;border-radius:6px}
 button{padding:10px 22px;font-size:16px;background:#0b5ed7;color:#fff;border:0;border-radius:6px;cursor:pointer}
 .err{background:#fdecea;color:#a33;padding:12px;border-radius:6px;margin-bottom:16px}
-.card{border:1px solid #ddd;border-radius:8px;padding:16px;margin-bottom:16px}
-.card h2{font-size:18px;margin:0 0 10px}
+.layout{display:grid;grid-template-columns:minmax(300px,380px) 1fr;gap:14px;align-items:start}
+.leftcol{position:sticky;top:12px}
+@media(max-width:900px){.layout{grid-template-columns:1fr}.leftcol{position:static}}
+.card{border:1px solid #ddd;border-radius:8px;padding:14px;margin-bottom:14px}
+.card h2{font-size:17px;margin:0 0 10px}
 .kv{display:grid;grid-template-columns:180px 1fr;gap:6px 12px;font-size:15px}
 .kv dt{color:#666}.kv dd{margin:0}
 table{width:100%;border-collapse:collapse;font-size:14px}
@@ -405,6 +408,8 @@ details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 </form>
 {% if error %}<div class="err">{{error}}</div>{% endif %}
 {% if results %}
+<div class="layout">
+<div class="leftcol">
 {% if aerial %}
 <div class="card"><h2>Property photo (aerial)</h2>
 <div style="position:relative;max-width:800px">
@@ -416,8 +421,10 @@ details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 {% if streetview %}
 <div class="card"><h2>Street-level view</h2>
 <div class="note">Street-level photos can't be embedded without paid map keys, but these open the exact spot with one click:</div>
-<p><a href="https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={{streetview}}" target="_blank" style="display:inline-block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none;margin-right:8px">Google Street View</a><a href="https://www.bing.com/maps?cp={{streetviewbing}}&lvl=18" target="_blank" style="display:inline-block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none;margin-right:8px">Bing Maps</a><a href="https://www.mapillary.com/app/?lat={{svlat}}&lng={{svlng}}&z=17" target="_blank" style="display:inline-block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none">Mapillary (open source)</a></p></div>
+<p><a href="https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={{streetview}}" target="_blank" style="display:block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none;margin-bottom:8px;text-align:center">Google Street View</a><a href="https://www.bing.com/maps?cp={{streetviewbing}}&lvl=18" target="_blank" style="display:block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none;margin-bottom:8px;text-align:center">Bing Maps</a><a href="https://www.mapillary.com/app/?lat={{svlat}}&lng={{svlng}}&z=17" target="_blank" style="display:block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none;text-align:center">Mapillary (open source)</a></p></div>
 {% endif %}
+</div>
+<div class="rightcol">
 {% for result in results %}
 <div class="card"><h2>{{result.matched}}</h2>
 {% if results|length > 1 %}<div class="note" style="margin-top:0">Parcel {{loop.index}} of {{results|length}} at this address.</div>{% endif %}
@@ -430,13 +437,13 @@ details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 <div class="card"><h2>{{result.kind}}</h2>
 <dl class="kv">{% for l,v in result.chars %}<dt>{{l}}</dt><dd>{{v}}</dd>{% endfor %}</dl></div>
 {% endif %}
-{% if result.assessed %}
 <div class="card"><h2>Assessed value history</h2>
+{% if result.assessed %}
 <table><tr><th>Year</th><th>Class</th><th>Total assessed</th></tr>
 {% for v in result.assessed %}<tr><td>{{v.year}}</td><td>{{v.class}}</td><td>${{v.total}}</td></tr>{% endfor %}
 </table>
+{% else %}<div class="note">Assessed values are temporarily unavailable — the county data portal isn't responding right now. Try again later.</div>{% endif %}
 <div class="note">These values are estimated by the Assessor's <a href="{{result.model_url}}" target="_blank">{{result.model_name}}</a> — the public computer model that predicts what the property would sell for. The code is open source.</div></div>
-{% endif %}
 {% if result.sales %}
 <div class="card"><h2>Recent sales</h2>
 <table><tr><th>Date</th><th>Price</th><th>Deed</th><th>Seller</th><th>Buyer</th></tr>
@@ -467,6 +474,8 @@ details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 {% for v in violations %}<tr><td>{{v.date}}</td><td>{{v.addr}}</td><td>{{v.desc}}<details><summary>details</summary><div class="note"><b>Inspector:</b> {{v.comments}}<br><b>Ordinance:</b> {{v.code}}<br><b>Bureau:</b> {{v.bureau}}</div></details></td><td>{{v.status}}</td></tr>{% endfor %}
 </table><div class="note">These are within about 150 meters and may belong to neighboring properties — check the address column.</div>{% else %}<div class="note">No violations found nearby.</div>{% endif %}</div>
 {% endif %}
+</div>
+</div>
 <div class="src">Sources: U.S. Census Geocoder, Cook County GIS &amp; Open Data Portal, City of Chicago Open Data Portal. Data may lag behind county/city updates.</div>
 {% endif %}
 </body></html>"""
