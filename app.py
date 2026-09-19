@@ -83,11 +83,13 @@ def _street_key(addr):
     return "", street
 
 
-def find_parcel(lat, lng, matched_address):
-    """Envelope query on the Assessor's parcel service, then pick the parcel
-    whose street address matches the geocoded address."""
+def find_parcels(lat, lng, matched_address):
+    """Envelope query on the Assessor's parcel service, then keep every parcel
+    whose house number AND street match the geocoded address. The house number
+    must match — a street-name-only match is never accepted, so a nearby parcel
+    can never be silently returned for the wrong address."""
     try:
-        d = 0.00012
+        d = 0.00045  # ~50 m: tolerates Census address-interpolation error
         r = requests.get(COOK_VIEWER, params={
             "geometry": f"{lng-d},{lat-d},{lng+d},{lat+d}",
             "geometryType": "esriGeometryEnvelope", "inSR": "4326",
@@ -98,33 +100,27 @@ def find_parcel(lat, lng, matched_address):
         if not feats:
             return None, "No Cook County parcel found at that location. Is the address in Cook County?"
         num, street = _street_key(matched_address)
-        best, best_score = None, -1
+        matches = []
         for f in feats:
             a = f["attributes"]
             ps = (a.get("street_address") or "").upper().strip()
             pnum, pstreet = _street_key(ps)
-            score = 0
-            if num and pnum == num:
-                score += 2
-            if street and pstreet and (street == pstreet or street in pstreet or pstreet in street):
-                score += 2
-            if score > best_score:
-                best, best_score = f, score
-        if best is None or best_score < 2:
-            # fall back to nearest centroid
-            def dist(f):
-                a = f["attributes"]
-                return abs((a.get("latitude") or 0) - lat) + abs((a.get("longitude") or 0) - lng)
-            best = min(feats, key=dist)
-        a = best["attributes"]
-        class_info = a.get("class_info_display") or ""
-        code = class_info.split()[0] if class_info else ""
+            if (num and pnum == num and street and pstreet
+                    and (street == pstreet or street in pstreet or pstreet in street)):
+                matches.append(f)
+        if not matches:
+            return None, ("Found nearby parcels but none match that house number — "
+                          "the map point may be slightly off. Try the full address with ZIP code.")
         parts = [p.strip() for p in matched_address.split(",")]
         city = parts[1].title() if len(parts) >= 2 else ""
-        return {"pin": a.get("PIN14") or "",
-                "municipality": city,
-                "bldg_class": code,
-                "class_info": class_info}, None
+        out = []
+        for f in sorted(matches, key=lambda f: f["attributes"].get("PIN14") or ""):
+            a = f["attributes"]
+            class_info = a.get("class_info_display") or ""
+            code = class_info.split()[0] if class_info else ""
+            out.append({"pin": a.get("PIN14") or "", "municipality": city,
+                        "bldg_class": code, "class_info": class_info})
+        return out, None
     except Exception as e:
         return None, f"Parcel lookup failed: {e}"
 
@@ -325,8 +321,10 @@ details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 <button type="submit">Look up</button>
 </form>
 {% if error %}<div class="err">{{error}}</div>{% endif %}
-{% if result %}
+{% if results %}
+{% for result in results %}
 <div class="card"><h2>{{result.matched}}</h2>
+{% if results|length > 1 %}<div class="note" style="margin-top:0">Parcel {{loop.index}} of {{results|length}} at this address.</div>{% endif %}
 <dl class="kv">
 <dt>Property ID (PIN)</dt><dd>{{result.pin}}</dd>
 <dt>Municipality</dt><dd>{{result.municipality}}</dd>
@@ -353,22 +351,23 @@ details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 {% if result.sales %}<dl class="kv"><dt>Most recent buyer</dt><dd>{{result.sales[0].buyer}} — bought {{result.sales[0].date}} for ${{result.sales[0].price}} ({{result.sales[0].deed}}, doc ref in sales table)</dd></dl>
 <div class="note">This is the last recorded buyer, which is usually but not always the current owner.</div>
 {% else %}<div class="note">No sales on record for this PIN, so no buyer name is available from free sources.</div>{% endif %}
-<div class="note">For the official taxpayer name, search this PIN on the Cook County Treasurer's site:</div>
+<div class="note">For the official taxpayer name, look up this PIN on the county sites (same ones CookViewer links to):</div>
 <dl class="kv"><dt>PIN</dt><dd>{{result.pin}}</dd></dl>
-<p><a href="https://www.cookcountytreasurer.com/" target="_blank" style="display:inline-block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none">Open the Treasurer's site</a></p></div>
+<p><a href="https://www.cookcountyassessor.com/pin/{{result.pin}}" target="_blank" style="display:inline-block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none;margin-right:8px">Assessor's page for this PIN</a><a href="https://www.cookcountytreasurer.com/" target="_blank" style="display:inline-block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none">Treasurer's site</a></p></div>
 <div class="card"><h2>Deeds & recorded documents</h2>
 <div class="note">The deed copies themselves aren't free — the Cook County Clerk sells them per document on their site, and there's no free download. Search this PIN on the Clerk's site to find and purchase them:</div>
 <dl class="kv"><dt>PIN to search</dt><dd>{{result.pin}}</dd></dl>
 <p><a href="https://crs.cookcountyclerkil.gov/Search" target="_blank" style="display:inline-block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none">Open the Clerk's recordings search</a></p>
 <div class="note">Tip: the sales table above already lists document numbers, dates, prices, and parties for recent transfers.</div></div>
-{% if result.permits is not none %}
+{% endfor %}
+{% if permits is not none %}
 <div class="card"><h2>Chicago building permits (nearby)</h2>
-{% if result.permits %}<table><tr><th>Issued</th><th>Type</th><th>Address</th><th>Description</th><th>Reported cost</th></tr>
-{% for p in result.permits %}<tr><td>{{p.date}}</td><td>{{p.type}}</td><td>{{p.address}}</td><td>{{p.desc}}</td><td>{{p.cost}}</td></tr>{% endfor %}
+{% if permits %}<table><tr><th>Issued</th><th>Type</th><th>Address</th><th>Description</th><th>Reported cost</th></tr>
+{% for p in permits %}<tr><td>{{p.date}}</td><td>{{p.type}}</td><td>{{p.address}}</td><td>{{p.desc}}</td><td>{{p.cost}}</td></tr>{% endfor %}
 </table>{% else %}<div class="note">No permits found nearby.</div>{% endif %}</div>
 <div class="card"><h2>Chicago building violations (nearby)</h2>
-{% if result.violations %}<table><tr><th>Date</th><th>Address</th><th>Violation</th><th>Status</th></tr>
-{% for v in result.violations %}<tr><td>{{v.date}}</td><td>{{v.addr}}</td><td>{{v.desc}}<details><summary>details</summary><div class="note"><b>Inspector:</b> {{v.comments}}<br><b>Ordinance:</b> {{v.code}}<br><b>Bureau:</b> {{v.bureau}}</div></details></td><td>{{v.status}}</td></tr>{% endfor %}
+{% if violations %}<table><tr><th>Date</th><th>Address</th><th>Violation</th><th>Status</th></tr>
+{% for v in violations %}<tr><td>{{v.date}}</td><td>{{v.addr}}</td><td>{{v.desc}}<details><summary>details</summary><div class="note"><b>Inspector:</b> {{v.comments}}<br><b>Ordinance:</b> {{v.code}}<br><b>Bureau:</b> {{v.bureau}}</div></details></td><td>{{v.status}}</td></tr>{% endfor %}
 </table><div class="note">These are within about 150 meters and may belong to neighboring properties — check the address column.</div>{% else %}<div class="note">No violations found nearby.</div>{% endif %}</div>
 {% endif %}
 <div class="src">Sources: U.S. Census Geocoder, Cook County GIS &amp; Open Data Portal, City of Chicago Open Data Portal. Data may lag behind county/city updates.</div>
@@ -378,43 +377,48 @@ details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 
 @app.route("/", methods=["GET"])
 def index():
-    return render_template_string(PAGE, q="", error=None, result=None)
+    return render_template_string(PAGE, q="", error=None, results=None, permits=None, violations=None)
 
 
 @app.route("/lookup", methods=["POST"])
 def lookup():
     q = request.form.get("address", "").strip()
     if not q:
-        return render_template_string(PAGE, q=q, error="Enter an address.", result=None)
+        return render_template_string(PAGE, q=q, error="Enter an address.", results=None, permits=None, violations=None)
 
     geo, err = geocode(q)
     if err:
-        return render_template_string(PAGE, q=q, error=err, result=None)
+        return render_template_string(PAGE, q=q, error=err, results=None,
+                                       permits=None, violations=None)
 
-    parcel, err = find_parcel(geo["lat"], geo["lng"], geo["matched"])
+    parcels, err = find_parcels(geo["lat"], geo["lng"], geo["matched"])
     if err:
-        return render_template_string(PAGE, q=q, error=err, result=None)
+        return render_template_string(PAGE, q=q, error=err, results=None,
+                                       permits=None, violations=None)
 
-    pin = parcel["pin"]
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        f_chars = ex.submit(get_characteristics, pin)
-        f_values = ex.submit(get_values, pin)
-        f_sales = ex.submit(get_sales, pin)
-        in_chicago = parcel["municipality"].lower() == "chicago"
+    in_chicago = parcels[0]["municipality"].lower() == "chicago"
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        jobs = [{"parcel": p,
+                 "f_chars": ex.submit(get_characteristics, p["pin"]),
+                 "f_values": ex.submit(get_values, p["pin"]),
+                 "f_sales": ex.submit(get_sales, p["pin"])} for p in parcels]
         f_permits = ex.submit(get_permits, geo["lat"], geo["lng"]) if in_chicago else None
         f_viol = ex.submit(get_violations, geo["lat"], geo["lng"]) if in_chicago else None
-        kind, chars = f_chars.result()
-        values = f_values.result()
-        sales = f_sales.result()
+        results = []
+        for j in jobs:
+            p = j["parcel"]
+            kind, chars = j["f_chars"].result()
+            results.append({"matched": geo["matched"], "pin": p["pin"],
+                            "municipality": p["municipality"],
+                            "class_desc": p.get("class_info") or class_description(p["bldg_class"]),
+                            "kind": kind, "chars": chars,
+                            "assessed": j["f_values"].result(),
+                            "sales": j["f_sales"].result()})
         permits = f_permits.result() if f_permits else None
         violations = f_viol.result() if f_viol else None
 
-    result = {"matched": geo["matched"], "pin": pin,
-              "municipality": parcel["municipality"],
-              "class_desc": parcel.get("class_info") or class_description(parcel["bldg_class"]),
-              "kind": kind, "chars": chars, "assessed": values, "sales": sales,
-              "permits": permits, "violations": violations}
-    return render_template_string(PAGE, q=q, error=None, result=result)
+    return render_template_string(PAGE, q=q, error=None, results=results,
+                                   permits=permits, violations=violations)
 
 
 def main():
