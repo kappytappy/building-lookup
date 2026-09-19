@@ -454,8 +454,8 @@ details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 <div class="card"><h2>Deeds & recorded documents</h2>
 <div class="note">The deed copies themselves aren't free — the Cook County Clerk sells them per document on their site, and there's no free download. Search this PIN on the Clerk's site to find and purchase them:</div>
 <dl class="kv"><dt>PIN to search</dt><dd>{{result.pin}}</dd></dl>
-<p><a href="https://crs.cookcountyclerkil.gov/Search" target="_blank" style="display:inline-block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none">Open the Clerk's recordings search</a></p>
-<div class="note">Tip: the sales table above already lists document numbers, dates, prices, and parties for recent transfers.</div></div>
+<p><button onclick="navigator.clipboard.writeText('{{result.pin}}');this.textContent='PIN copied — paste it on the Clerk site'" style="display:inline-block;padding:10px 22px;background:#6c757d;color:#fff;border:0;border-radius:6px;margin-right:8px;cursor:pointer">Copy PIN</button><a href="https://crs.cookcountyclerkil.gov/Search" target="_blank" style="display:inline-block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none">Open the Clerk's recordings search</a></p>
+<div class="note">Tip: on the Clerk's site choose PIN search and paste the PIN — you'll get the full list of recorded documents (deeds, mortgages, liens) with the option to purchase copies. The sales table above already lists document numbers, dates, prices, and parties for recent transfers, free.</div></div>
 {% endfor %}
 {% if permits is not none %}
 <div class="card"><h2>Chicago building permits (nearby)</h2>
