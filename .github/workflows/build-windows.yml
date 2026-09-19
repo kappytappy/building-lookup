@@ -17,9 +17,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt pyinstaller
       - name: Build exe
-        run: pyinstaller --onefile --noconsole --name building-lookup app.py
+        run: python -m PyInstaller --onefile --noconsole --name building-lookup app.py
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
