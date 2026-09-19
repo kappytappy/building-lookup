@@ -6,6 +6,7 @@ Type any Cook County address, get the building's story:
 - Assessed value history, recent sales
 - Chicago building permits + violations (Chicago addresses)
 - Estimated market value (from assessed values + county assessment levels)
+- Possible owners & residents (one-click public-record people searches)
 - Crime & safety nearby, schools nearby (Chicago addresses)
 - FEMA flood zone
 
@@ -23,6 +24,7 @@ import threading
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from urllib.parse import quote_plus
 
 import requests
 from flask import Flask, request, render_template_string
@@ -109,6 +111,36 @@ def geocode(address):
                 "matched": m["matchedAddress"]}, None
     except Exception as e:
         return None, f"Geocoding failed: {e}"
+
+
+def resident_links(matched):
+    """One-click people-search lookups for an address.
+
+    Free people-search sites (FastPeopleSearch, TruePeopleSearch) block bots,
+    so the app can't pull resident names directly — instead it builds the
+    exact search links and opens them in the user's browser. The
+    FastPeopleSearch URL pattern was verified live: the site shows names and
+    ages per address."""
+    parts = [p.strip() for p in (matched or "").split(",")]
+    street = parts[0] if parts else ""
+    city = parts[1] if len(parts) > 1 else ""
+    state = parts[2].split()[0] if len(parts) > 2 else ""
+    zm = re.search(r"\b(\d{5})\b", parts[2]) if len(parts) > 2 else None
+    zipc = zm.group(1) if zm else ""
+
+    def kebab(s):
+        return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", s.lower())).strip("-")
+
+    fps = None
+    if street and city and state and zipc:
+        fps = ("https://www.fastpeoplesearch.com/address/"
+               f"{kebab(street)}_{kebab(city)}-{state.lower()}-{zipc}")
+    q = quote_plus(f'"{matched}"')
+    return {"fps": fps,
+            "truepeople": "https://www.truepeoplesearch.com/",
+            "google": f"https://www.google.com/search?q={q}",
+            "bing": f"https://www.bing.com/search?q={q}",
+            "address": matched}
 
 
 # ---------------- step 2: coordinates -> parcel / PIN ----------------
@@ -612,7 +644,7 @@ details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 {% if summary.sale %}<div class="stat"><div class="statv">${{summary.sale.price}}</div><div class="statl">Last sold {{summary.sale.date}}</div></div>{% endif %}
 </div>
 <div class="secnav">Sections:
-<a href="#assessed">Assessed values</a> · <a href="#value">Market estimate</a> · <a href="#sales">Sales</a> · <a href="#ownership">Ownership</a> · <a href="#deeds">Deeds</a>{% if permits is not none %} · <a href="#crime">Crime &amp; safety</a> · <a href="#schools">Schools</a>{% endif %} · <a href="#flood">Flood zone</a>{% if permits is not none %} · <a href="#permits">Permits</a> · <a href="#violations">Violations</a>{% endif %}
+<a href="#assessed">Assessed values</a> · <a href="#value">Market estimate</a> · <a href="#sales">Sales</a> · <a href="#ownership">Ownership</a> · <a href="#residents">Residents</a> · <a href="#deeds">Deeds</a>{% if permits is not none %} · <a href="#crime">Crime &amp; safety</a> · <a href="#schools">Schools</a>{% endif %} · <a href="#flood">Flood zone</a>{% if permits is not none %} · <a href="#permits">Permits</a> · <a href="#violations">Violations</a>{% endif %}
 </div>
 {% endif %}
 {% for result in results %}
@@ -659,6 +691,12 @@ details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 <p><button onclick="navigator.clipboard.writeText('{{result.pin}}');this.textContent='PIN copied — paste it on the Clerk site'" style="display:inline-block;padding:10px 22px;background:#6c757d;color:#fff;border:0;border-radius:6px;margin-right:8px;cursor:pointer">Copy PIN</button><a href="https://crs.cookcountyclerkil.gov/Search" target="_blank" style="display:inline-block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none">Open the Clerk's recordings search</a></p>
 <div class="note">Tip: on the Clerk's site choose PIN search and paste the PIN — you'll get the full list of recorded documents (deeds, mortgages, liens) with the option to purchase copies. The sales table above already lists document numbers, dates, prices, and parties for recent transfers, free.</div></div>
 {% endfor %}
+{% if residents %}
+<div class="card" id="residents"><h2>Possible owners &amp; residents</h2>
+<div class="note">Name lists like Spokeo's come from public-record aggregators — the same free people-search sites below. They block automated lookups, so this app can't pull the names itself, but these buttons open the exact address in your browser with one click. Treat names as leads, not facts: they may be outdated or belong to past residents.</div>
+<p>{% if residents.fps %}<a href="{{residents.fps}}" target="_blank" style="display:block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none;margin-bottom:8px;text-align:center">FastPeopleSearch — names &amp; ages at this address (free)</a>{% endif %}<a href="{{residents.truepeople}}" target="_blank" style="display:block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none;margin-bottom:8px;text-align:center">TruePeopleSearch — address search (free)</a><a href="{{residents.google}}" target="_blank" style="display:block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none;margin-bottom:8px;text-align:center">Google — pages mentioning "{{residents.address}}"</a><a href="{{residents.bing}}" target="_blank" style="display:block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none;text-align:center">Bing — pages mentioning "{{residents.address}}"</a></p>
+<div class="note">Past owners from county sales records are listed in the Sales and Ownership sections above. For the official current taxpayer name, use the PIN links in the Ownership section.</div></div>
+{% endif %}
 {% if crime %}
 <div class="card" id="crime"><h2>Crime &amp; safety nearby</h2>
 {% if crime.error %}<div class="note">Crime data is temporarily unavailable — the city data portal isn't responding right now. Try again later.</div>
@@ -713,26 +751,26 @@ details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 
 @app.route("/", methods=["GET"])
 def index():
-    return render_template_string(PAGE, q="", error=None, results=None, permits=None, violations=None, aerial=None, outline=None, streetview=None, crime=None, schools=None, flood=None, summary=None)
+    return render_template_string(PAGE, q="", error=None, results=None, permits=None, violations=None, aerial=None, outline=None, streetview=None, crime=None, schools=None, flood=None, summary=None, residents=None)
 
 
 @app.route("/lookup", methods=["POST"])
 def lookup():
     q = request.form.get("address", "").strip()
     if not q:
-        return render_template_string(PAGE, q=q, error="Enter an address.", results=None, permits=None, violations=None, aerial=None, outline=None, streetview=None, crime=None, schools=None, flood=None, summary=None)
+        return render_template_string(PAGE, q=q, error="Enter an address.", results=None, permits=None, violations=None, aerial=None, outline=None, streetview=None, crime=None, schools=None, flood=None, summary=None, residents=None)
 
     geo, err = geocode(q)
     if err:
         return render_template_string(PAGE, q=q, error=err, results=None,
                                        permits=None, violations=None,
-                                       aerial=None, outline=None, streetview=None, crime=None, schools=None, flood=None, summary=None)
+                                       aerial=None, outline=None, streetview=None, crime=None, schools=None, flood=None, summary=None, residents=None)
 
     parcels, err = find_parcels(geo["lat"], geo["lng"], geo["matched"])
     if err:
         return render_template_string(PAGE, q=q, error=err, results=None,
                                        permits=None, violations=None,
-                                       aerial=None, outline=None, streetview=None, crime=None, schools=None, flood=None, summary=None)
+                                       aerial=None, outline=None, streetview=None, crime=None, schools=None, flood=None, summary=None, residents=None)
 
     in_chicago = parcels[0]["municipality"].lower() == "chicago"
     with ThreadPoolExecutor(max_workers=10) as ex:
@@ -796,10 +834,11 @@ def lookup():
                "interior": interior,
                "sqft": char_of(r0["chars"], "Building sq ft", "Unit sq ft"),
                "sale": r0["sales"][0] if r0["sales"] else None}
+    residents = resident_links(geo["matched"])
     return render_template_string(PAGE, q=q, error=None, results=results,
                                    permits=permits, violations=violations,
                                    crime=crime, schools=schools, flood=flood,
-                                   summary=summary,
+                                   summary=summary, residents=residents,
                                    aerial=aerial, outline=outline,
                                    streetview=f"{lat},{lng}",
                                    streetviewbing=f"{lat}~{lng}",
