@@ -5,18 +5,24 @@ Type any Cook County address, get the building's story:
 - Building characteristics (year built, sq footage, beds/baths, construction)
 - Assessed value history, recent sales
 - Chicago building permits + violations (Chicago addresses)
+- Estimated market value (from assessed values + county assessment levels)
+- Crime & safety nearby, schools nearby (Chicago addresses)
+- FEMA flood zone
 
 All data comes from free public government APIs - no keys, no cost:
 - U.S. Census Geocoder (address -> coordinates)
 - Cook County GIS parcel service (coordinates -> PIN)
 - Cook County Open Data (datacatalog.cookcountyil.gov)
 - City of Chicago Open Data (data.cityofchicago.org)
+- FEMA National Flood Hazard Layer (no key)
 """
+import math
 import re
 import sys
 import threading
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 
 import requests
 from flask import Flask, request, render_template_string
@@ -337,6 +343,172 @@ def get_violations(lat, lng):
         return []
 
 
+# ---------------- step 6: market value, crime, schools, flood ----------------
+
+def market_estimate(assessed, bldg_class):
+    """Estimate market value from the latest assessed total.
+
+    Cook County assesses residential property (class 1xx/2xx) at 10% of
+    market value and commercial/industrial (class 5xx) at 25%, so dividing
+    the assessed value by that level gives a market estimate. Returns a
+    dict or None."""
+    try:
+        c = int(str(bldg_class).strip()[:3])
+    except (TypeError, ValueError):
+        c = 0
+    if 100 <= c < 300:
+        ratio, kind = 0.10, "residential"
+    elif 500 <= c < 600:
+        ratio, kind = 0.25, "commercial/industrial"
+    else:
+        return None
+    row = latest(assessed) if assessed else None
+    if not row:
+        return None
+    try:
+        total = float(str(row.get("total", "")).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    if total <= 0:
+        return None
+    return {"value": f"{total / ratio:,.0f}", "assessed": row.get("total"),
+            "year": row.get("year"), "ratio": f"{ratio:.0%}", "kind": kind}
+
+
+VIOLENT_CRIMES = {"HOMICIDE", "CRIMINAL SEXUAL ASSAULT", "AGGRAVATED ASSAULT",
+                  "AGGRAVATED BATTERY", "ASSAULT", "BATTERY", "ROBBERY",
+                  "KIDNAPPING", "SEX OFFENSE", "INTIMIDATION", "STALKING"}
+PROPERTY_CRIMES = {"BURGLARY", "THEFT", "MOTOR VEHICLE THEFT", "ARSON",
+                   "CRIMINAL DAMAGE", "CRIMINAL TRESPASS"}
+
+
+def get_crimes(lat, lng):
+    """Police-reported crimes within ~800 m (1/2 mile) over the last 12 months.
+
+    Returns a summary dict, or {"error": True} when the city portal is
+    unreachable (so the UI can say so instead of showing zero)."""
+    try:
+        since = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+        rows = socrata(CHI_SOCRATA, "ijzp-q8t2", {
+            "$select": "primary_type",
+            "$where": (f"within_circle(location, {lat}, {lng}, 800) "
+                       f"AND date >= '{since}T00:00:00'"),
+            "$limit": "5000"})
+    except Exception:
+        return {"error": True}
+    counts = {}
+    for r in rows:
+        t = (r.get("primary_type") or "").strip().upper()
+        if t:
+            counts[t] = counts.get(t, 0) + 1
+    return {"total": sum(counts.values()),
+            "violent": sum(n for t, n in counts.items() if t in VIOLENT_CRIMES),
+            "property": sum(n for t, n in counts.items() if t in PROPERTY_CRIMES),
+            "top": [(t.title(), n)
+                    for t, n in sorted(counts.items(), key=lambda kv: -kv[1])[:8]]}
+
+
+SCHOOLS_META = "https://data.cityofchicago.org/api/views/pb6d-zzuh"
+
+
+def _haversine_mi(lat1, lng1, lat2, lng2):
+    r = 3959.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    h = (math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) *
+         math.sin(math.radians(lng2 - lng1) / 2) ** 2)
+    return 2 * r * math.asin(math.sqrt(h))
+
+
+def get_schools(lat, lng):
+    """Nearest Chicago public schools within 1 mile.
+
+    Discovers the dataset's column names at runtime from the portal's own
+    metadata, so it keeps working if the portal renames columns."""
+    try:
+        meta = SESSION.get(SCHOOLS_META, timeout=HTTP_TIMEOUT).json()
+        cols = {c["fieldName"]: c for c in meta.get("columns", [])}
+        loc = next((f for f, c in cols.items()
+                    if c.get("dataTypeName") in ("point", "location")), None)
+
+        def pick(*names):
+            return next((n for n in names if n in cols), None)
+
+        name_c = pick("long_name", "school_name", "name")
+        addr_c = pick("address", "street_address")
+        grades_c = pick("grades_offered", "grades", "grade_levels")
+        type_c = pick("school_type", "type")
+        if not loc or not name_c:
+            return {"error": True}
+        sel = ",".join(c for c in [name_c, addr_c, grades_c, type_c, loc] if c)
+        rows = socrata(CHI_SOCRATA, "pb6d-zzuh", {
+            "$select": sel,
+            "$where": f"within_circle({loc}, {lat}, {lng}, 1609)",
+            "$limit": "50"})
+    except Exception:
+        return {"error": True}
+    out = []
+    for r in rows:
+        pt = r.get(loc) or {}
+        try:
+            if isinstance(pt, dict) and "coordinates" in pt:
+                slng, slat = pt["coordinates"][:2]
+            else:
+                slat, slng = float(pt["latitude"]), float(pt["longitude"])
+            dist = _haversine_mi(lat, lng, slat, slng)
+        except (TypeError, ValueError, KeyError):
+            continue
+        out.append({"name": clean_num(r.get(name_c)),
+                    "address": clean_num(r.get(addr_c)) if addr_c else "",
+                    "grades": clean_num(r.get(grades_c)) if grades_c else "",
+                    "type": clean_num(r.get(type_c)) if type_c else "",
+                    "miles": round(dist, 1)})
+    out.sort(key=lambda s: s["miles"])
+    return {"schools": out[:8]}
+
+
+FEMA_ZONE = ("https://hazards.fema.gov/arcgis/rest/services/public/NFHL/"
+             "MapServer/28/query")
+
+
+def get_flood(lat, lng):
+    """FEMA flood zone at the address. Returns a dict or {"error": True}."""
+    try:
+        r = SESSION.get(FEMA_ZONE, params={
+            "geometry": f"{lng},{lat}", "geometryType": "esriGeometryPoint",
+            "inSR": "4326", "spatialRel": "esriSpatialRelIntersects",
+            "outFields": "FLD_ZONE,ZONE_SUBTY,SFHA_TF",
+            "returnGeometry": "false", "f": "json"}, timeout=HTTP_TIMEOUT)
+        feats = r.json().get("features", [])
+    except Exception:
+        return {"error": True}
+    if not feats:
+        return {"zone": None,
+                "meaning": ("No flood-zone data for this exact spot — FEMA "
+                            "hasn't mapped it or the map is incomplete here.")}
+    a = feats[0]["attributes"]
+    zone = (a.get("FLD_ZONE") or "").strip().upper()
+    sub = (a.get("ZONE_SUBTY") or "").strip()
+    sfha = (a.get("SFHA_TF") or "").strip().upper() == "T"
+    if not zone:
+        meaning = "No flood zone assigned here."
+    elif sfha or zone[:1] in ("A", "V"):
+        meaning = ("High flood risk — inside the 100-year floodplain (1% "
+                   "annual chance). Flood insurance is usually required with "
+                   "a mortgage here.")
+    elif zone == "X" and "0.2" in sub:
+        meaning = ("Moderate flood risk — inside the 500-year floodplain "
+                   "(0.2% annual chance).")
+    elif zone == "X":
+        meaning = "Minimal flood risk — outside even the 500-year floodplain."
+    elif zone == "D":
+        meaning = ("Flood risk undetermined — FEMA hasn't finished mapping "
+                   "this area.")
+    else:
+        meaning = f"FEMA flood zone {zone}."
+    return {"zone": zone or None, "subtype": sub, "sfha": sfha,
+            "meaning": meaning}
+
+
 # ---------------- step 5: aerial property photo ----------------
 
 def get_parcel_photo(pin):
@@ -399,6 +571,13 @@ td{border-bottom:1px solid #eee;padding:6px;vertical-align:top}
 .note{font-size:13px;color:#666;margin-top:16px}
 details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 .src{font-size:12px;color:#999}
+.strip{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+.stat{flex:1;min-width:120px;border:1px solid #ddd;border-radius:8px;padding:10px 8px;text-align:center;background:#f8f9fa}
+.statv{font-size:19px;font-weight:600}
+.statl{font-size:12px;color:#666;margin-top:2px}
+.secnav{font-size:13px;color:#666;margin-bottom:14px;line-height:1.9}
+.secnav a{color:#0b5ed7;text-decoration:none}
+.secnav a:hover{text-decoration:underline}
 </style></head><body>
 <h1>Building Lookup</h1>
 <div class="sub">Enter any Cook County address - building details from free public government data.</div>
@@ -425,6 +604,17 @@ details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 {% endif %}
 </div>
 <div class="rightcol">
+{% if summary %}
+<div class="strip">
+{% if summary.market %}<div class="stat"><div class="statv">${{summary.market}}</div><div class="statl">Est. market value</div></div>{% endif %}
+{% if summary.interior %}<div class="stat"><div class="statv">{{summary.interior}}</div><div class="statl">Interior</div></div>{% endif %}
+{% if summary.sqft %}<div class="stat"><div class="statv">{{summary.sqft}} sqft</div><div class="statl">Building</div></div>{% endif %}
+{% if summary.sale %}<div class="stat"><div class="statv">${{summary.sale.price}}</div><div class="statl">Last sold {{summary.sale.date}}</div></div>{% endif %}
+</div>
+<div class="secnav">Sections:
+<a href="#assessed">Assessed values</a> · <a href="#value">Market estimate</a> · <a href="#sales">Sales</a> · <a href="#ownership">Ownership</a> · <a href="#deeds">Deeds</a>{% if permits is not none %} · <a href="#crime">Crime &amp; safety</a> · <a href="#schools">Schools</a>{% endif %} · <a href="#flood">Flood zone</a>{% if permits is not none %} · <a href="#permits">Permits</a> · <a href="#violations">Violations</a>{% endif %}
+</div>
+{% endif %}
 {% for result in results %}
 <div class="card"><h2>{{result.matched}}</h2>
 {% if results|length > 1 %}<div class="note" style="margin-top:0">Parcel {{loop.index}} of {{results|length}} at this address.</div>{% endif %}
@@ -437,20 +627,25 @@ details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 <div class="card"><h2>{{result.kind}}</h2>
 <dl class="kv">{% for l,v in result.chars %}<dt>{{l}}</dt><dd>{{v}}</dd>{% endfor %}</dl></div>
 {% endif %}
-<div class="card"><h2>Assessed value history</h2>
+<div class="card" id="assessed"><h2>Assessed value history</h2>
 {% if result.assessed %}
 <table><tr><th>Year</th><th>Class</th><th>Total assessed</th></tr>
 {% for v in result.assessed %}<tr><td>{{v.year}}</td><td>{{v.class}}</td><td>${{v.total}}</td></tr>{% endfor %}
 </table>
 {% else %}<div class="note">Assessed values are temporarily unavailable — the county data portal isn't responding right now. Try again later.</div>{% endif %}
 <div class="note">These values are estimated by the Assessor's <a href="{{result.model_url}}" target="_blank">{{result.model_name}}</a> — the public computer model that predicts what the property would sell for. The code is open source.</div></div>
+<div class="card" id="value"><h2>Estimated market value</h2>
+{% if result.market %}<div style="font-size:26px;font-weight:600">≈ ${{result.market.value}}</div>
+<div class="note">The Assessor's {{result.market.year}} assessed value was ${{result.market.assessed}}. Cook County assesses {{result.market.kind}} property at {{result.market.ratio}} of market value, so market ≈ assessed ÷ {{result.market.ratio}}. This is an estimate from public records, not an appraisal.</div>
+{% elif result.assessed %}<div class="note">Can't estimate a market value for this property class from free data — the county doesn't publish a standard assessment level for it.</div>
+{% else %}<div class="note">Market estimate unavailable — the county data portal isn't responding right now. Try again later.</div>{% endif %}</div>
 {% if result.sales %}
-<div class="card"><h2>Recent sales</h2>
+<div class="card" id="sales"><h2>Recent sales</h2>
 <table><tr><th>Date</th><th>Price</th><th>Deed</th><th>Seller</th><th>Buyer</th></tr>
 {% for s in result.sales %}<tr><td>{{s.date}}</td><td>${{s.price}}</td><td>{{s.deed}}</td><td>{{s.seller}}</td><td>{{s.buyer}}</td></tr>{% endfor %}
 </table></div>
 {% endif %}
-<div class="card"><h2>Ownership</h2>
+<div class="card" id="ownership"><h2>Ownership</h2>
 <div class="note">No free public API lists the current owner by name — the county sites that have it block automated lookups. The best free source is the most recent buyer on record:</div>
 {% if result.sales %}<dl class="kv"><dt>Most recent buyer</dt><dd>{{result.sales[0].buyer}} — bought {{result.sales[0].date}} for ${{result.sales[0].price}} ({{result.sales[0].deed}}, doc ref in sales table)</dd></dl>
 <div class="note">This is the last recorded buyer, which is usually but not always the current owner.</div>
@@ -458,51 +653,86 @@ details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 <div class="note">For the official taxpayer name, look up this PIN on the county sites (same ones CookViewer links to):</div>
 <dl class="kv"><dt>PIN</dt><dd>{{result.pin}}</dd></dl>
 <p><a href="https://www.cookcountyassessor.com/pin/{{result.pin}}" target="_blank" style="display:inline-block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none;margin-right:8px">Assessor's page for this PIN</a><a href="https://www.cookcountytreasurer.com/" target="_blank" style="display:inline-block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none">Treasurer's site</a></p></div>
-<div class="card"><h2>Deeds & recorded documents</h2>
+<div class="card" id="deeds"><h2>Deeds & recorded documents</h2>
 <div class="note">The deed copies themselves aren't free — the Cook County Clerk sells them per document on their site, and there's no free download. Search this PIN on the Clerk's site to find and purchase them:</div>
 <dl class="kv"><dt>PIN to search</dt><dd>{{result.pin}}</dd></dl>
 <p><button onclick="navigator.clipboard.writeText('{{result.pin}}');this.textContent='PIN copied — paste it on the Clerk site'" style="display:inline-block;padding:10px 22px;background:#6c757d;color:#fff;border:0;border-radius:6px;margin-right:8px;cursor:pointer">Copy PIN</button><a href="https://crs.cookcountyclerkil.gov/Search" target="_blank" style="display:inline-block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none">Open the Clerk's recordings search</a></p>
 <div class="note">Tip: on the Clerk's site choose PIN search and paste the PIN — you'll get the full list of recorded documents (deeds, mortgages, liens) with the option to purchase copies. The sales table above already lists document numbers, dates, prices, and parties for recent transfers, free.</div></div>
 {% endfor %}
+{% if crime %}
+<div class="card" id="crime"><h2>Crime &amp; safety nearby</h2>
+{% if crime.error %}<div class="note">Crime data is temporarily unavailable — the city data portal isn't responding right now. Try again later.</div>
+{% elif crime.total %}
+<div class="strip">
+<div class="stat"><div class="statv">{{crime.total}}</div><div class="statl">reported crimes<br>last 12 mo · ½ mile</div></div>
+<div class="stat"><div class="statv">{{crime.violent}}</div><div class="statl">violent</div></div>
+<div class="stat"><div class="statv">{{crime.property}}</div><div class="statl">property</div></div>
+</div>
+<table><tr><th>Offense</th><th>Reports</th></tr>
+{% for t,n in crime.top %}<tr><td>{{t}}</td><td>{{n}}</td></tr>{% endfor %}</table>
+<div class="note">Police-reported crimes within about 800 m (½ mile) over the last 12 months. Counts come from the city's open crime data and reflect reports, not convictions.</div>
+{% else %}<div class="note">No crimes reported within ½ mile in the last 12 months.</div>{% endif %}
+<div class="src">Source: City of Chicago open crime data.</div></div>
+{% endif %}
+{% if schools %}
+<div class="card" id="schools"><h2>Schools nearby</h2>
+{% if schools.error %}<div class="note">School data is temporarily unavailable — the city data portal isn't responding right now. Try again later.</div>
+{% elif schools.schools %}
+<table><tr><th>School</th><th>Grades</th><th>Distance</th></tr>
+{% for s in schools.schools %}<tr><td>{{s.name}}{% if s.address %}<br><span class="src">{{s.address}}</span>{% endif %}{% if s.type %}<br><span class="src">{{s.type}}</span>{% endif %}</td><td>{{s.grades}}</td><td>{{s.miles}} mi</td></tr>{% endfor %}</table>
+<div class="note">Chicago public schools within about 1 mile, nearest first.</div>
+{% else %}<div class="note">No Chicago public schools found within 1 mile.</div>{% endif %}
+<div class="src">Source: City of Chicago open data (Chicago Public Schools locations).</div></div>
+{% endif %}
+{% if flood %}
+<div class="card" id="flood"><h2>Flood zone</h2>
+{% if flood.error %}<div class="note">Flood-zone data is temporarily unavailable — FEMA's map service isn't responding right now. Try again later.</div>
+{% else %}
+<dl class="kv"><dt>FEMA flood zone</dt><dd>{{flood.zone or "Not mapped"}}</dd></dl>
+<div class="note">{{flood.meaning}}</div>
+{% if flood.subtype %}<div class="note">Zone detail: {{flood.subtype}}</div>{% endif %}
+{% endif %}
+<div class="src">Source: FEMA National Flood Hazard Layer.</div></div>
+{% endif %}
 {% if permits is not none %}
-<div class="card"><h2>Chicago building permits (nearby)</h2>
+<div class="card" id="permits"><h2>Chicago building permits (nearby)</h2>
 {% if permits %}<table><tr><th>Issued</th><th>Type</th><th>Address</th><th>Description</th><th>Reported cost</th></tr>
 {% for p in permits %}<tr><td>{{p.date}}</td><td>{{p.type}}</td><td>{{p.address}}</td><td>{{p.desc}}</td><td>{{p.cost}}</td></tr>{% endfor %}
 </table>{% else %}<div class="note">No permits found nearby.</div>{% endif %}</div>
-<div class="card"><h2>Chicago building violations (nearby)</h2>
+<div class="card" id="violations"><h2>Chicago building violations (nearby)</h2>
 {% if violations %}<table><tr><th>Date</th><th>Address</th><th>Violation</th><th>Status</th></tr>
 {% for v in violations %}<tr><td>{{v.date}}</td><td>{{v.addr}}</td><td>{{v.desc}}<details><summary>details</summary><div class="note"><b>Inspector:</b> {{v.comments}}<br><b>Ordinance:</b> {{v.code}}<br><b>Bureau:</b> {{v.bureau}}</div></details></td><td>{{v.status}}</td></tr>{% endfor %}
 </table><div class="note">These are within about 150 meters and may belong to neighboring properties — check the address column.</div>{% else %}<div class="note">No violations found nearby.</div>{% endif %}</div>
 {% endif %}
 </div>
 </div>
-<div class="src">Sources: U.S. Census Geocoder, Cook County GIS &amp; Open Data Portal, City of Chicago Open Data Portal. Data may lag behind county/city updates.</div>
+<div class="src">Sources: U.S. Census Geocoder, Cook County GIS &amp; Open Data Portal, City of Chicago Open Data Portal, FEMA National Flood Hazard Layer. Data may lag behind government updates.</div>
 {% endif %}
 </body></html>"""
 
 
 @app.route("/", methods=["GET"])
 def index():
-    return render_template_string(PAGE, q="", error=None, results=None, permits=None, violations=None, aerial=None, outline=None, streetview=None)
+    return render_template_string(PAGE, q="", error=None, results=None, permits=None, violations=None, aerial=None, outline=None, streetview=None, crime=None, schools=None, flood=None, summary=None)
 
 
 @app.route("/lookup", methods=["POST"])
 def lookup():
     q = request.form.get("address", "").strip()
     if not q:
-        return render_template_string(PAGE, q=q, error="Enter an address.", results=None, permits=None, violations=None, aerial=None, outline=None, streetview=None)
+        return render_template_string(PAGE, q=q, error="Enter an address.", results=None, permits=None, violations=None, aerial=None, outline=None, streetview=None, crime=None, schools=None, flood=None, summary=None)
 
     geo, err = geocode(q)
     if err:
         return render_template_string(PAGE, q=q, error=err, results=None,
                                        permits=None, violations=None,
-                                       aerial=None, outline=None, streetview=None)
+                                       aerial=None, outline=None, streetview=None, crime=None, schools=None, flood=None, summary=None)
 
     parcels, err = find_parcels(geo["lat"], geo["lng"], geo["matched"])
     if err:
         return render_template_string(PAGE, q=q, error=err, results=None,
                                        permits=None, violations=None,
-                                       aerial=None, outline=None, streetview=None)
+                                       aerial=None, outline=None, streetview=None, crime=None, schools=None, flood=None, summary=None)
 
     in_chicago = parcels[0]["municipality"].lower() == "chicago"
     with ThreadPoolExecutor(max_workers=10) as ex:
@@ -512,26 +742,64 @@ def lookup():
                  "f_sales": ex.submit(get_sales, p["pin"])} for p in parcels]
         f_permits = ex.submit(get_permits, geo["lat"], geo["lng"]) if in_chicago else None
         f_viol = ex.submit(get_violations, geo["lat"], geo["lng"]) if in_chicago else None
+        f_crime = ex.submit(get_crimes, geo["lat"], geo["lng"]) if in_chicago else None
+        f_schools = ex.submit(get_schools, geo["lat"], geo["lng"]) if in_chicago else None
+        f_flood = ex.submit(get_flood, geo["lat"], geo["lng"])
         f_photo = ex.submit(get_parcel_photo, parcels[0]["pin"])
         results = []
         for j in jobs:
             p = j["parcel"]
             kind, chars = j["f_chars"].result()
+            assessed = j["f_values"].result()
             model_name, model_url = model_link(p["bldg_class"])
             results.append({"matched": geo["matched"], "pin": p["pin"],
                             "municipality": p["municipality"],
                             "class_desc": p.get("class_info") or class_description(p["bldg_class"]),
                             "kind": kind, "chars": chars,
-                            "assessed": j["f_values"].result(),
+                            "assessed": assessed,
+                            "market": market_estimate(assessed, p["bldg_class"]),
                             "sales": j["f_sales"].result(),
                             "model_name": model_name, "model_url": model_url})
         permits = f_permits.result() if f_permits else None
         violations = f_viol.result() if f_viol else None
+        crime = f_crime.result() if f_crime else None
+        schools = f_schools.result() if f_schools else None
+        flood = f_flood.result()
         aerial, outline = f_photo.result()
 
     lat, lng = geo["lat"], geo["lng"]
+
+    def char_of(chars, *labels):
+        for l, v in chars:
+            if l in labels:
+                return v
+        return ""
+    r0 = results[0]
+
+    def fmt_num(s):
+        try:
+            f = float(s)
+            return str(int(f)) if f == int(f) else str(f)
+        except (TypeError, ValueError):
+            return s
+    beds = char_of(r0["chars"], "Bedrooms")
+    try:
+        baths_n = (float(char_of(r0["chars"], "Full baths") or 0) +
+                   0.5 * float(char_of(r0["chars"], "Half baths") or 0))
+    except ValueError:
+        baths_n = 0
+    interior = " · ".join(x for x in
+                          [(fmt_num(beds) + " bd") if beds else "",
+                           (fmt_num(baths_n) + " ba") if baths_n else ""]
+                          if x)
+    summary = {"market": r0["market"]["value"] if r0["market"] else None,
+               "interior": interior,
+               "sqft": char_of(r0["chars"], "Building sq ft", "Unit sq ft"),
+               "sale": r0["sales"][0] if r0["sales"] else None}
     return render_template_string(PAGE, q=q, error=None, results=results,
                                    permits=permits, violations=violations,
+                                   crime=crime, schools=schools, flood=flood,
+                                   summary=summary,
                                    aerial=aerial, outline=outline,
                                    streetview=f"{lat},{lng}",
                                    streetviewbing=f"{lat}~{lng}",
