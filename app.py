@@ -24,6 +24,35 @@ from flask import Flask, request, render_template_string
 app = Flask(__name__)
 HTTP_TIMEOUT = 20
 
+
+def _windows_proxies():
+    """Read the system proxy from the Windows registry (browsers use this, but
+    Python's requests ignores it, so a PC behind a proxy/VPN gets TLS errors)."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") as k:
+            enabled, _ = winreg.QueryValueEx(k, "ProxyEnable")
+            if not enabled:
+                return {}
+            server, _ = winreg.QueryValueEx(k, "ProxyServer")
+        proxies = {}
+        if "=" in server:
+            for part in server.split(";"):
+                if "=" in part:
+                    scheme, host = part.split("=", 1)
+                    proxies[scheme.strip().lower()] = "http://" + host.strip()
+        else:
+            proxies = {"http": "http://" + server.strip(),
+                       "https": "http://" + server.strip()}
+        return proxies
+    except Exception:
+        return {}
+
+
+SESSION = requests.Session()
+SESSION.proxies.update(_windows_proxies())
+
 COOK_VIEWER = ("https://gis.cookcountyil.gov/traditional/rest/services/"
                "CookViewer3Parcels/MapServer/0/query")
 COOK_ORTHO = ("https://gis.cookcountyil.gov/traditional/rest/services/"
@@ -62,7 +91,7 @@ def clean_num(v):
 
 def geocode(address):
     try:
-        r = requests.get(
+        r = SESSION.get(
             "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress",
             params={"address": address, "benchmark": "2020", "format": "json"},
             timeout=HTTP_TIMEOUT)
@@ -94,7 +123,7 @@ def find_parcels(lat, lng, matched_address):
     can never be silently returned for the wrong address."""
     try:
         d = 0.00045  # ~50 m: tolerates Census address-interpolation error
-        r = requests.get(COOK_VIEWER, params={
+        r = SESSION.get(COOK_VIEWER, params={
             "geometry": f"{lng-d},{lat-d},{lng+d},{lat+d}",
             "geometryType": "esriGeometryEnvelope", "inSR": "4326",
             "spatialRel": "esriSpatialRelIntersects", "returnGeometry": "false",
@@ -132,7 +161,7 @@ def find_parcels(lat, lng, matched_address):
 # ---------------- step 3: PIN -> characteristics / values / sales ----------------
 
 def socrata(base, dataset, params):
-    r = requests.get(f"{base}/{dataset}.json", params=params, timeout=HTTP_TIMEOUT)
+    r = SESSION.get(f"{base}/{dataset}.json", params=params, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
@@ -301,11 +330,18 @@ def get_parcel_photo(pin):
     """Returns (aerial_img_url, outline_img_url) — a county aerial photo of the
     parcel with the parcel boundaries drawn over it. No API key needed."""
     try:
-        r = requests.get(COOK_VIEWER, params={
-            "where": f"PIN14='{pin}'", "returnGeometry": "true",
-            "outSR": "4326", "outFields": "PIN14", "f": "json"},
-            timeout=HTTP_TIMEOUT)
-        feats = r.json().get("features", [])
+        feats = []
+        for attempt in range(2):
+            try:
+                r = SESSION.get(COOK_VIEWER, params={
+                    "where": f"PIN14='{pin}'", "returnGeometry": "true",
+                    "outSR": "4326", "outFields": "PIN14", "f": "json"},
+                    timeout=40)
+                feats = r.json().get("features", [])
+                if feats:
+                    break
+            except Exception:
+                continue
         if not feats:
             return None, None
         rings = feats[0]["geometry"]["rings"]
