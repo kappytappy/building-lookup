@@ -184,6 +184,19 @@ def dash_pin(pin14):
     return f"{p[0:2]}-{p[2:4]}-{p[4:7]}-{p[7:10]}-{p[10:14]}"
 
 
+def model_link(code):
+    """Pick the Assessor's valuation-model repo matching a property class code."""
+    try:
+        c = int(str(code).strip()[:3])
+    except (TypeError, ValueError):
+        c = 0
+    if c in (299, 399):
+        return ("condominium valuation model", "https://github.com/ccao-data/model-condo-avm")
+    if 200 <= c < 300:
+        return ("residential valuation model", "https://github.com/ccao-data/model-res-avm")
+    return ("Assessor valuation models", "https://github.com/ccao-data")
+
+
 def get_characteristics(pin):
     """Returns (kind_label, [(label, value), ...])."""
     try:
@@ -421,7 +434,8 @@ details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 <div class="card"><h2>Assessed value history</h2>
 <table><tr><th>Year</th><th>Class</th><th>Total assessed</th></tr>
 {% for v in result.assessed %}<tr><td>{{v.year}}</td><td>{{v.class}}</td><td>${{v.total}}</td></tr>{% endfor %}
-</table></div>
+</table>
+<div class="note">These values are estimated by the Assessor's <a href="{{result.model_url}}" target="_blank">{{result.model_name}}</a> — the public computer model that predicts what the property would sell for. The code is open source.</div></div>
 {% endif %}
 {% if result.sales %}
 <div class="card"><h2>Recent sales</h2>
@@ -494,12 +508,14 @@ def lookup():
         for j in jobs:
             p = j["parcel"]
             kind, chars = j["f_chars"].result()
+            model_name, model_url = model_link(p["bldg_class"])
             results.append({"matched": geo["matched"], "pin": p["pin"],
                             "municipality": p["municipality"],
                             "class_desc": p.get("class_info") or class_description(p["bldg_class"]),
                             "kind": kind, "chars": chars,
                             "assessed": j["f_values"].result(),
-                            "sales": j["f_sales"].result()})
+                            "sales": j["f_sales"].result(),
+                            "model_name": model_name, "model_url": model_url})
         permits = f_permits.result() if f_permits else None
         violations = f_viol.result() if f_viol else None
         aerial, outline = f_photo.result()
