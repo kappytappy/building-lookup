@@ -339,6 +339,11 @@ td{border-bottom:1px solid #eee;padding:6px;vertical-align:top}
 {% for s in result.sales %}<tr><td>{{s.date}}</td><td>${{s.price}}</td><td>{{s.deed}}</td><td>{{s.seller}}</td><td>{{s.buyer}}</td></tr>{% endfor %}
 </table></div>
 {% endif %}
+<div class="card"><h2>Deeds & recorded documents</h2>
+<div class="note">The deed copies themselves aren't free — the Cook County Clerk sells them per document on their site, and there's no free download. Search this PIN on the Clerk's site to find and purchase them:</div>
+<dl class="kv"><dt>PIN to search</dt><dd>{{result.pin}}</dd></dl>
+<p><a href="https://crs.cookcountyclerkil.gov/Search" target="_blank" style="display:inline-block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none">Open the Clerk's recordings search</a></p>
+<div class="note">Tip: the sales table above already lists document numbers, dates, prices, and parties for recent transfers.</div></div>
 {% if result.permits is not none %}
 <div class="card"><h2>Chicago building permits (nearby)</h2>
 {% if result.permits %}<table><tr><th>Issued</th><th>Type</th><th>Address</th><th>Description</th><th>Reported cost</th></tr>
