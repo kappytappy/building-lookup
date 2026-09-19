@@ -392,6 +392,19 @@ details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 </form>
 {% if error %}<div class="err">{{error}}</div>{% endif %}
 {% if results %}
+{% if aerial %}
+<div class="card"><h2>Property photo (aerial)</h2>
+<div style="position:relative;max-width:800px">
+<img src="{{aerial}}" alt="Aerial photo of the property" style="width:100%;display:block;border-radius:6px">
+<img src="{{outline}}" alt="" style="position:absolute;top:0;left:0;width:100%;pointer-events:none">
+</div>
+<div class="note">Aerial imagery from Cook County GIS with parcel boundaries overlaid — it may be a few years old, so recent changes might not show.</div></div>
+{% endif %}
+{% if streetview %}
+<div class="card"><h2>Street-level view</h2>
+<div class="note">Street-level photos can't be embedded without paid map keys, but these open the exact spot with one click:</div>
+<p><a href="https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={{streetview}}" target="_blank" style="display:inline-block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none;margin-right:8px">Google Street View</a><a href="https://www.bing.com/maps?cp={{streetviewbing}}&lvl=18" target="_blank" style="display:inline-block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none;margin-right:8px">Bing Maps</a><a href="https://www.mapillary.com/app/?lat={{svlat}}&lng={{svlng}}&z=17" target="_blank" style="display:inline-block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none">Mapillary (open source)</a></p></div>
+{% endif %}
 {% for result in results %}
 <div class="card"><h2>{{result.matched}}</h2>
 {% if results|length > 1 %}<div class="note" style="margin-top:0">Parcel {{loop.index}} of {{results|length}} at this address.</div>{% endif %}
@@ -400,14 +413,6 @@ details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 <dt>Municipality</dt><dd>{{result.municipality}}</dd>
 <dt>Property class</dt><dd>{{result.class_desc}}</dd>
 </dl></div>
-{% if result.aerial %}
-<div class="card"><h2>Property photo (aerial)</h2>
-<div style="position:relative;max-width:800px">
-<img src="{{result.aerial}}" alt="Aerial photo of the property" style="width:100%;display:block;border-radius:6px">
-<img src="{{result.outline}}" alt="" style="position:absolute;top:0;left:0;width:100%;pointer-events:none">
-</div>
-<div class="note">Aerial imagery from Cook County GIS with parcel boundaries overlaid — it may be a few years old, so recent changes might not show.</div></div>
-{% endif %}
 {% if result.kind %}
 <div class="card"><h2>{{result.kind}}</h2>
 <dl class="kv">{% for l,v in result.chars %}<dt>{{l}}</dt><dd>{{v}}</dd>{% endfor %}</dl></div>
@@ -455,51 +460,57 @@ details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 
 @app.route("/", methods=["GET"])
 def index():
-    return render_template_string(PAGE, q="", error=None, results=None, permits=None, violations=None)
+    return render_template_string(PAGE, q="", error=None, results=None, permits=None, violations=None, aerial=None, outline=None, streetview=None)
 
 
 @app.route("/lookup", methods=["POST"])
 def lookup():
     q = request.form.get("address", "").strip()
     if not q:
-        return render_template_string(PAGE, q=q, error="Enter an address.", results=None, permits=None, violations=None)
+        return render_template_string(PAGE, q=q, error="Enter an address.", results=None, permits=None, violations=None, aerial=None, outline=None, streetview=None)
 
     geo, err = geocode(q)
     if err:
         return render_template_string(PAGE, q=q, error=err, results=None,
-                                       permits=None, violations=None)
+                                       permits=None, violations=None,
+                                       aerial=None, outline=None, streetview=None)
 
     parcels, err = find_parcels(geo["lat"], geo["lng"], geo["matched"])
     if err:
         return render_template_string(PAGE, q=q, error=err, results=None,
-                                       permits=None, violations=None)
+                                       permits=None, violations=None,
+                                       aerial=None, outline=None, streetview=None)
 
     in_chicago = parcels[0]["municipality"].lower() == "chicago"
     with ThreadPoolExecutor(max_workers=10) as ex:
         jobs = [{"parcel": p,
                  "f_chars": ex.submit(get_characteristics, p["pin"]),
                  "f_values": ex.submit(get_values, p["pin"]),
-                 "f_sales": ex.submit(get_sales, p["pin"]),
-                 "f_photo": ex.submit(get_parcel_photo, p["pin"])} for p in parcels]
+                 "f_sales": ex.submit(get_sales, p["pin"])} for p in parcels]
         f_permits = ex.submit(get_permits, geo["lat"], geo["lng"]) if in_chicago else None
         f_viol = ex.submit(get_violations, geo["lat"], geo["lng"]) if in_chicago else None
+        f_photo = ex.submit(get_parcel_photo, parcels[0]["pin"])
         results = []
         for j in jobs:
             p = j["parcel"]
             kind, chars = j["f_chars"].result()
-            aerial, outline = j["f_photo"].result()
             results.append({"matched": geo["matched"], "pin": p["pin"],
                             "municipality": p["municipality"],
                             "class_desc": p.get("class_info") or class_description(p["bldg_class"]),
                             "kind": kind, "chars": chars,
                             "assessed": j["f_values"].result(),
-                            "sales": j["f_sales"].result(),
-                            "aerial": aerial, "outline": outline})
+                            "sales": j["f_sales"].result()})
         permits = f_permits.result() if f_permits else None
         violations = f_viol.result() if f_viol else None
+        aerial, outline = f_photo.result()
 
+    lat, lng = geo["lat"], geo["lng"]
     return render_template_string(PAGE, q=q, error=None, results=results,
-                                   permits=permits, violations=violations)
+                                   permits=permits, violations=violations,
+                                   aerial=aerial, outline=outline,
+                                   streetview=f"{lat},{lng}",
+                                   streetviewbing=f"{lat}~{lng}",
+                                   svlat=lat, svlng=lng)
 
 
 def main():
