@@ -17,7 +17,9 @@ All data comes from free public government APIs - no keys, no cost:
 - City of Chicago Open Data (data.cityofchicago.org)
 - FEMA National Flood Hazard Layer (no key)
 """
+import json
 import math
+import os
 import re
 import sys
 import threading
@@ -27,7 +29,7 @@ from datetime import datetime, timedelta
 from urllib.parse import quote_plus
 
 import requests
-from flask import Flask, request, render_template_string
+from flask import Flask, request, render_template_string, redirect
 
 app = Flask(__name__)
 HTTP_TIMEOUT = 20
@@ -60,6 +62,82 @@ def _windows_proxies():
 
 SESSION = requests.Session()
 SESSION.proxies.update(_windows_proxies())
+
+
+# ---------------- browser choice ----------------
+
+def _browser_config_path():
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "browser_choice.json")
+
+
+def detect_browsers():
+    """[(label, exe path)] for browsers installed on this Windows PC."""
+    if os.name != "nt":
+        return []
+    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+    pfx = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    lad = os.environ.get("LocalAppData", "")
+    candidates = [
+        ("Google Chrome", [os.path.join(pf, "Google", "Chrome", "Application", "chrome.exe"),
+                           os.path.join(lad, "Google", "Chrome", "Application", "chrome.exe")]),
+        ("Microsoft Edge", [os.path.join(pf, "Microsoft", "Edge", "Application", "msedge.exe"),
+                            os.path.join(pfx, "Microsoft", "Edge", "Application", "msedge.exe")]),
+        ("Firefox", [os.path.join(pf, "Mozilla Firefox", "firefox.exe"),
+                     os.path.join(pfx, "Mozilla Firefox", "firefox.exe")]),
+        ("Brave", [os.path.join(lad, "BraveSoftware", "Brave-Browser", "Application", "brave.exe")]),
+        ("Opera", [os.path.join(lad, "Programs", "Opera", "opera.exe")]),
+        ("Vivaldi", [os.path.join(lad, "Vivaldi", "Application", "vivaldi.exe")]),
+    ]
+    found = []
+    for label, paths in candidates:
+        for p in paths:
+            if p and os.path.isfile(p):
+                found.append((label, p))
+                break
+    return found
+
+
+def load_browser_choice():
+    try:
+        with open(_browser_config_path()) as f:
+            return json.load(f).get("browser") or ""
+    except Exception:
+        return ""
+
+
+def open_in_browser(url):
+    """Open a URL in the user's chosen browser (falls back to system default)."""
+    choice = load_browser_choice()
+    if choice:
+        for label, path in detect_browsers():
+            if label == choice and os.path.isfile(path):
+                try:
+                    webbrowser.BackgroundBrowser(path).open(url)
+                    return
+                except Exception:
+                    break
+    webbrowser.open(url)
+
+
+@app.context_processor
+def inject_browser_settings():
+    return {"browsers": [label for label, _ in detect_browsers()],
+            "browser_choice": load_browser_choice()}
+
+
+@app.route("/set-browser", methods=["POST"])
+def set_browser():
+    choice = request.form.get("browser", "")
+    try:
+        with open(_browser_config_path(), "w") as f:
+            json.dump({"browser": choice}, f)
+    except Exception:
+        pass
+    return redirect("/")
 
 COOK_VIEWER = ("https://gis.cookcountyil.gov/traditional/rest/services/"
                "CookViewer3Parcels/MapServer/0/query")
@@ -135,8 +213,10 @@ def resident_links(matched):
     if street and city and state and zipc:
         fps = ("https://www.fastpeoplesearch.com/address/"
                f"{kebab(street)}_{kebab(city)}-{state.lower()}-{zipc}")
+    phonebooks = ("https://www.phonebooks.com/address/" + kebab(matched)) if matched else None
     q = quote_plus(f'"{matched}"')
     return {"fps": fps,
+            "phonebooks": phonebooks,
             "truepeople": "https://www.truepeoplesearch.com/",
             "google": f"https://www.google.com/search?q={q}",
             "bing": f"https://www.bing.com/search?q={q}",
@@ -618,6 +698,18 @@ details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 <button type="submit">Look up</button>
 </form>
 {% if error %}<div class="err">{{error}}</div>{% endif %}
+{% if results is none %}
+<div class="card"><h2>Settings</h2>
+<form method="post" action="/set-browser">
+<label>Open the report in
+<select name="browser">
+<option value=""{% if not browser_choice %} selected{% endif %}>System default</option>
+{% for label in browsers %}<option value="{{label}}"{% if label == browser_choice %} selected{% endif %}>{{label}}</option>{% endfor %}
+</select></label>
+<button type="submit">Save</button>
+</form>
+<div class="note">Takes effect the next time you launch the app — the report page and all one-click buttons then open in this browser.</div></div>
+{% endif %}
 {% if results %}
 <div class="layout">
 <div class="leftcol">
@@ -694,7 +786,7 @@ details{margin-top:6px}summary{cursor:pointer;color:#0b5ed7;font-size:13px}
 {% if residents %}
 <div class="card" id="residents"><h2>Possible owners &amp; residents</h2>
 <div class="note">Name lists like Spokeo's come from public-record aggregators — the same free people-search sites below. They block automated lookups, so this app can't pull the names itself, but these buttons open the exact address in your browser with one click. Treat names as leads, not facts: they may be outdated or belong to past residents.</div>
-<p>{% if residents.fps %}<a href="{{residents.fps}}" target="_blank" style="display:block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none;margin-bottom:8px;text-align:center">FastPeopleSearch — names &amp; ages at this address (free)</a>{% endif %}<a href="{{residents.truepeople}}" target="_blank" style="display:block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none;margin-bottom:8px;text-align:center">TruePeopleSearch — address search (free)</a><a href="{{residents.google}}" target="_blank" style="display:block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none;margin-bottom:8px;text-align:center">Google — pages mentioning "{{residents.address}}"</a><a href="{{residents.bing}}" target="_blank" style="display:block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none;text-align:center">Bing — pages mentioning "{{residents.address}}"</a></p>
+<p>{% if residents.fps %}<a href="{{residents.fps}}" target="_blank" style="display:block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none;margin-bottom:8px;text-align:center">FastPeopleSearch — names &amp; ages at this address (free)</a>{% endif %}{% if residents.phonebooks %}<a href="{{residents.phonebooks}}" target="_blank" style="display:block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none;margin-bottom:8px;text-align:center">PhoneBooks — owners &amp; tenants at this address (free)</a>{% endif %}<a href="{{residents.truepeople}}" target="_blank" style="display:block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none;margin-bottom:8px;text-align:center">TruePeopleSearch — address search (free)</a><a href="{{residents.google}}" target="_blank" style="display:block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none;margin-bottom:8px;text-align:center">Google — pages mentioning "{{residents.address}}"</a><a href="{{residents.bing}}" target="_blank" style="display:block;padding:10px 22px;background:#0b5ed7;color:#fff;border-radius:6px;text-decoration:none;text-align:center">Bing — pages mentioning "{{residents.address}}"</a></p>
 <div class="note">Past owners from county sales records are listed in the Sales and Ownership sections above. For the official current taxpayer name, use the PIN links in the Ownership section.</div></div>
 {% endif %}
 {% if crime %}
@@ -847,7 +939,7 @@ def lookup():
 
 def main():
     if getattr(sys, "frozen", False):
-        threading.Timer(1.2, lambda: webbrowser.open("http://127.0.0.1:5000")).start()
+        threading.Timer(1.2, lambda: open_in_browser("http://127.0.0.1:5000")).start()
     app.run(host="127.0.0.1", port=5000, debug=False)
 
 
